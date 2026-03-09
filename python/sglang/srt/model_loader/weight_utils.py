@@ -62,6 +62,7 @@ try:
 except ImportError as e:
     SafeTensorsFileLoader = SingleGroup = None
 
+
 logger = logging.getLogger(__name__)
 
 

@@ -88,6 +88,7 @@ LOAD_FORMAT_CHOICES = [
     "remote",
     "remote_instance",
     "fastsafetensors",
+    "mx_gds",
     "private",
 ]
 
