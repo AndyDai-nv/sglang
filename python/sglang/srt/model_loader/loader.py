@@ -2317,15 +2317,13 @@ class RemoteInstanceModelLoader(BaseModelLoader):
 
         # Register local memory based on backend
         if src_result.backend == "nixl":
-            from modelexpress.nixl_transfer import NixlTransferManager
+            from nixl._api import nixl_agent as NixlAgent, nixl_agent_config
             import uuid
 
             agent_name = f"mx-target-{tp_rank}-{uuid.uuid4().hex[:8]}"
-            nixl_mgr = NixlTransferManager(agent_name, device_config.gpu_id)
-            nixl_mgr.initialize()
-
-            tensors = {name: param for name, param in model.named_parameters()}
-            nixl_mgr.register_tensors(tensors)
+            config = nixl_agent_config(backends=["UCX"])
+            nixl_agent = NixlAgent(agent_name, config)
+            logger.info("NIXL target agent '%s' created on device %d", agent_name, device_config.gpu_id)
         else:
             transfer_engine = load_config.remote_instance_weight_loader_transfer_engine
             if transfer_engine is None:
@@ -2354,7 +2352,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         # Execute via detected backend
         if src_result.backend == "nixl":
             planner.execute_nixl(
-                nixl_mgr._agent, ops, src_result.rank_to_nixl_metadata,
+                nixl_agent, ops, src_result.rank_to_nixl_metadata,
                 device_config.gpu_id,
             )
         else:
@@ -2380,7 +2378,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             model.post_load_weights()
 
         if src_result.backend == "nixl":
-            nixl_mgr.shutdown()
+            del nixl_agent
 
         logger.info("ModelExpress: weight transfer complete for tp_rank=%d", tp_rank)
 
