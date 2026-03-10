@@ -2354,6 +2354,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             planner.execute_nixl(
                 nixl_agent, ops, src_result.rank_to_nixl_metadata,
                 device_config.gpu_id,
+                rank_to_device_id=src_result.rank_to_device_id,
             )
         else:
             planner.execute(transfer_engine, ops, src_result.rank_to_session)
