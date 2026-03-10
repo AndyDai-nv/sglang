@@ -2275,11 +2275,11 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         """Load weights via ModelExpress coordination + TransferEngine RDMA.
 
         Supports mixed tensor-parallelism: source TP != target TP.
-        All tensors are transferred via RDMA (NVLink intra-node or IB).
+        Uses modelexpress.transfer_planner for plan computation and execution.
         """
-        from collections import defaultdict
-
+        from modelexpress.adapters.sglang import extract_target_params
         from modelexpress.client import MxClient
+        from modelexpress.transfer_planner import TransferPlanner, build_source_index
 
         transfer_engine = load_config.remote_instance_weight_loader_transfer_engine
         if transfer_engine is None:
@@ -2311,7 +2311,6 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                     f"(model={model_name})"
                 )
 
-            # Get ALL source workers
             response = mx_client.get_metadata(model_name)
             if not response.found or len(response.workers) == 0:
                 raise RuntimeError(
@@ -2322,20 +2321,15 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 "ModelExpress: got %d source workers", len(response.workers)
             )
 
-            # Build source index: {tensor_name: {src_rank: TensorDescriptor}}
-            source_index = defaultdict(dict)
-            rank_to_session = {}
-            for w in response.workers:
-                backend_field = w.WhichOneof("backend_metadata")
-                if backend_field == "transfer_engine_session_id":
-                    rank_to_session[w.worker_rank] = w.transfer_engine_session_id
-                for td in w.tensors:
-                    source_index[td.name][w.worker_rank] = td
+            source_index, rank_to_session = build_source_index(response.workers)
         finally:
             mx_client.close()
 
-        ops, dim1_fixups = _compute_transfer_plan(
-            model, source_index, tp_rank, tp_size
+        # Compute and execute transfer plan via modelexpress planner
+        target_params = extract_target_params(model, tp_rank, tp_size)
+        planner = TransferPlanner()
+        ops, dim1_fixups = planner.compute_plan(
+            source_index, target_params, tp_rank, tp_size
         )
 
         logger.info(
@@ -2343,16 +2337,11 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             len(ops), len(dim1_fixups),
         )
 
-        # Execute RDMA
-        _execute_transfer_plan(transfer_engine, ops, rank_to_session)
-
-        # For params sharded on inner dimension, apply GPU-side column slicing
-        _apply_dim1_fixups(dim1_fixups)
+        planner.execute(transfer_engine, ops, rank_to_session)
+        planner.apply_dim1_fixups(dim1_fixups)
 
         # Fix weight_scale: fill all elements with max(scale) so that
         # requantize_with_max_scale() becomes an identity operation.
-        # The seed's weights are already requantized with the global max scale,
-        # so setting all weight_scale elements to max makes requant a no-op.
         for module_name, module in model.named_modules():
             weight_scale = getattr(module, "weight_scale", None)
             if weight_scale is not None and isinstance(weight_scale, torch.nn.Parameter):
@@ -2361,330 +2350,14 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                     weight_scale.data.fill_(max_val)
 
         # Run process_weights_after_loading on each quantized module.
-        # This handles: transpose FP8 weights, requantize with max scale
-        # (identity since all weight_scale elements are max),
-        # and convert scales to per-channel format.
         for module_name, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
                 quant_method.process_weights_after_loading(module)
-        # Also call model-level post_load_weights if it exists (e.g., DeepSeek)
         if hasattr(model, "post_load_weights"):
             model.post_load_weights()
 
         logger.info("ModelExpress: weight transfer complete for tp_rank=%d", tp_rank)
-
-
-def _compute_transfer_plan(model, source_index, tp_rank, tp_size):
-    """Compute RDMA transfer ops for mixed tensor-parallelism.
-
-    For each local parameter, determines which byte ranges to read from which
-    source ranks. Returns (ops, dim1_fixups) where:
-      - ops: list of (src_rank, src_addr, src_offset, dst_addr, dst_offset, length, param_name)
-      - dim1_fixups: list of dicts for params sharded on dim 1 (inner dimension)
-        that need post-transfer GPU-side column slicing.
-
-    Four cases:
-    1. Legacy (no shard metadata): 1:1 rank match
-    2. Replicated (shard_dim == -1): read from any one source rank
-    3. Dim-0 sharded: byte-range overlap algorithm (contiguous row slicing)
-    4. Dim-1 sharded: transfer full source shard + GPU-side column slice
-    """
-    param_to_module = {}
-    for module_name, module in model.named_modules():
-        for param_name, _ in module.named_parameters(recurse=False):
-            full_name = f"{module_name}.{param_name}" if module_name else param_name
-            param_to_module[full_name] = module
-
-    ops = []
-    dim1_fixups = []
-
-    for name, param in model.named_parameters():
-        if name not in source_index:
-            raise RuntimeError(f"ModelExpress: {name} not found in source metadata")
-
-        src_tensors = source_index[name]
-        td0 = next(iter(src_tensors.values()))
-        local_size = param.numel() * param.element_size()
-        dst_addr = param.data_ptr()
-
-        # Case 1: Legacy (old source that didn't publish shard metadata)
-        if td0.effective_tp_size == 0:
-            if tp_rank not in src_tensors:
-                raise RuntimeError(
-                    f"ModelExpress: no source rank {tp_rank} for {name} (legacy mode)"
-                )
-            src_td = src_tensors[tp_rank]
-            if src_td.size != local_size:
-                raise RuntimeError(
-                    f"ModelExpress: size mismatch for {name}: "
-                    f"seed={src_td.size}, local={local_size}"
-                )
-            ops.append((tp_rank, src_td.addr, 0, dst_addr, 0, local_size, name))
-            continue
-
-        shard_dim = td0.shard_dim
-        src_eff_tp = td0.effective_tp_size
-
-        # Case 2: Replicated tensor (norms, biases, scales, etc.)
-        # Note: src_eff_tp <= 1 alone does NOT mean replicated. Source TP=1
-        # has unsharded weights, but if target TP > 1 and shard_dim >= 0,
-        # we still need the overlap algorithm to extract the correct slice.
-        if shard_dim == -1:
-            src_rank = min(src_tensors.keys())
-            src_td = src_tensors[src_rank]
-            if src_td.size != local_size:
-                new_data = torch.empty(
-                    src_td.size // param.element_size(),
-                    dtype=param.dtype,
-                    device=param.device,
-                )
-                param.data = new_data
-                dst_addr = new_data.data_ptr()
-                local_size = src_td.size
-                logger.info(
-                    "ModelExpress: reallocated %s to %d bytes (was %d)",
-                    name, src_td.size, param.numel() * param.element_size(),
-                )
-            ops.append((src_rank, src_td.addr, 0, dst_addr, 0, local_size, name))
-            continue
-
-        module = param_to_module.get(name)
-        tgt_eff_tp = getattr(module, "tp_size", tp_size) if module else tp_size
-        tgt_shard_index = getattr(module, "tp_rank", tp_rank) if module else tp_rank
-
-        full_dim = td0.full_shape[shard_dim]
-        src_shard = full_dim // src_eff_tp
-        tgt_shard = full_dim // tgt_eff_tp
-
-        # Bytes per unit along the shard dimension
-        stride = td0.size // src_shard if src_shard > 0 else 0
-
-        # Case 4: Inner-dimension sharding (shard_dim >= 1).
-        # Byte-range overlap only works on the outermost dimension (dim 0)
-        # because row-major storage stores inner dims contiguously per row.
-        # For dim-1 sharding: transfer full source shard to a temp buffer,
-        # then do a GPU-side column slice after all RDMA transfers complete.
-        if shard_dim >= 1 and len(td0.full_shape) >= 2:
-            non_shard_dim = td0.full_shape[0]  # rows (not sharded)
-            src_cols = src_shard  # columns per source rank
-            tgt_cols = tgt_shard  # columns target needs
-
-            tgt_global_start = tgt_shard_index * tgt_cols
-            tgt_global_end = tgt_global_start + tgt_cols
-
-            for src_rank in sorted(src_tensors.keys()):
-                src_td = src_tensors[src_rank]
-                src_global_start = src_td.shard_index * src_cols
-                src_global_end = src_global_start + src_cols
-
-                ov_start = max(tgt_global_start, src_global_start)
-                ov_end = min(tgt_global_end, src_global_end)
-
-                if ov_start < ov_end:
-                    # Allocate temp buffer for full source shard
-                    temp = torch.empty(
-                        src_td.size, dtype=torch.uint8, device=param.device,
-                    )
-                    ops.append((
-                        src_rank, src_td.addr, 0,
-                        temp.data_ptr(), 0, src_td.size, name,
-                    ))
-                    dim1_fixups.append({
-                        "param": param,
-                        "name": name,
-                        "temp": temp,
-                        "src_shape": [non_shard_dim, src_cols],
-                        "src_col_start": ov_start - src_global_start,
-                        "src_col_end": ov_end - src_global_start,
-                        "dst_col_start": ov_start - tgt_global_start,
-                        "dst_shape": [non_shard_dim, tgt_cols],
-                        "dtype": param.dtype,
-                        "elem_size": param.element_size(),
-                    })
-            continue
-
-        # Case 3: Outer-dimension sharding (shard_dim == 0).
-        # Byte-range overlap works directly on contiguous row ranges.
-        expected_size = tgt_shard * stride
-        if local_size != expected_size:
-            new_data = torch.empty(
-                expected_size // param.element_size(),
-                dtype=param.dtype,
-                device=param.device,
-            )
-            param.data = new_data
-            dst_addr = new_data.data_ptr()
-            local_size = expected_size
-            logger.info(
-                "ModelExpress: reallocated sharded %s to %d bytes (was %d)",
-                name, expected_size, param.numel() * param.element_size(),
-            )
-
-        # Merged column-parallel layers (QKV, gate_up) pack multiple
-        # sub-tensors along dim 0. Each sub-tensor must be overlapped
-        # independently because the physical layout is [sub0_local,
-        # sub1_local, ...] not a contiguous slice of the full dim.
-        output_sizes = getattr(module, "output_sizes", None) if module else None
-        if output_sizes is not None:
-            src_sub_offset = 0
-            dst_sub_offset = 0
-            for sub_full in output_sizes:
-                sub_src_shard = sub_full // src_eff_tp
-                sub_tgt_shard = sub_full // tgt_eff_tp
-
-                sub_tgt_start = tgt_shard_index * sub_tgt_shard
-                sub_tgt_end = sub_tgt_start + sub_tgt_shard
-
-                for src_rank in sorted(src_tensors.keys()):
-                    src_td = src_tensors[src_rank]
-                    sub_src_start = src_td.shard_index * sub_src_shard
-                    sub_src_end = sub_src_start + sub_src_shard
-
-                    ov_start = max(sub_tgt_start, sub_src_start)
-                    ov_end = min(sub_tgt_end, sub_src_end)
-
-                    if ov_start < ov_end:
-                        src_byte_off = (
-                            src_sub_offset + (ov_start - sub_src_start)
-                        ) * stride
-                        dst_byte_off = (
-                            dst_sub_offset + (ov_start - sub_tgt_start)
-                        ) * stride
-                        length = (ov_end - ov_start) * stride
-
-                        ops.append((
-                            src_rank, src_td.addr, src_byte_off,
-                            dst_addr, dst_byte_off, length, name,
-                        ))
-
-                src_sub_offset += sub_src_shard
-                dst_sub_offset += sub_tgt_shard
-        else:
-            # Simple (non-merged) dim-0 overlap
-            tgt_start = tgt_shard_index * tgt_shard
-            tgt_end = tgt_start + tgt_shard
-
-            for src_rank in sorted(src_tensors.keys()):
-                src_td = src_tensors[src_rank]
-                src_start = src_td.shard_index * src_shard
-                src_end = src_start + src_shard
-
-                ov_start = max(tgt_start, src_start)
-                ov_end = min(tgt_end, src_end)
-
-                if ov_start < ov_end:
-                    src_byte_off = (ov_start - src_start) * stride
-                    dst_byte_off = (ov_start - tgt_start) * stride
-                    length = (ov_end - ov_start) * stride
-
-                    ops.append((
-                        src_rank, src_td.addr, src_byte_off,
-                        dst_addr, dst_byte_off, length, name,
-                    ))
-
-    return ops, dim1_fixups
-
-
-def _apply_dim1_fixups(fixups):
-    """Apply GPU-side column slicing for params sharded on the inner dimension.
-
-    For shard_dim >= 1, RDMA transfers full source shards into temp buffers.
-    This function slices out the needed column ranges and copies them into
-    the target param storage.
-    """
-    if not fixups:
-        return
-
-    # Group fixups by param name to handle multi-source concatenation
-    from collections import defaultdict
-
-    by_param = defaultdict(list)
-    for f in fixups:
-        by_param[f["name"]].append(f)
-
-    for name, param_fixups in by_param.items():
-        param = param_fixups[0]["param"]
-        dst_shape = param_fixups[0]["dst_shape"]
-        elem_size = param_fixups[0]["elem_size"]
-        dtype = param_fixups[0]["dtype"]
-        rows = dst_shape[0]
-        tgt_cols = dst_shape[1]
-
-        # Ensure target param has the correct size
-        expected_elems = rows * tgt_cols
-        if param.numel() != expected_elems:
-            new_data = torch.empty(
-                expected_elems, dtype=dtype, device=param.device,
-            )
-            param.data = new_data
-
-        dst = param.data.reshape(rows, tgt_cols)
-
-        for f in param_fixups:
-            src_shape = f["src_shape"]
-            src_cols = src_shape[1]
-            num_src_bytes = src_shape[0] * src_cols * elem_size
-
-            src_tensor = f["temp"][:num_src_bytes].view(dtype).reshape(
-                src_shape[0], src_cols
-            )
-            sliced = src_tensor[:, f["src_col_start"] : f["src_col_end"]]
-            ncols = f["src_col_end"] - f["src_col_start"]
-            dst_start = f["dst_col_start"]
-            dst[:, dst_start : dst_start + ncols] = sliced
-
-    logger.info(
-        "ModelExpress: applied %d dim-1 fixups for %d params",
-        len(fixups),
-        len(by_param),
-    )
-
-
-def _execute_transfer_plan(transfer_engine, ops, rank_to_session):
-    """Execute RDMA transfer ops grouped by source rank.
-
-    Only receives large ops (>= 1MB). Small ops are loaded from disk.
-    """
-    from collections import defaultdict
-
-    if not ops:
-        return
-
-    by_rank = defaultdict(list)
-    for op in ops:
-        by_rank[op[0]].append(op)
-
-    total_bytes = sum(op[5] for op in ops)
-    logger.info(
-        "ModelExpress: RDMA %d ops, %.2f GB across %d source ranks",
-        len(ops), total_bytes / 1e9, len(by_rank),
-    )
-
-    for src_rank in sorted(by_rank.keys()):
-        rank_ops = by_rank[src_rank]
-        session_id = rank_to_session.get(src_rank)
-        if session_id is None:
-            raise RuntimeError(
-                f"ModelExpress: no TransferEngine session for source rank {src_rank}"
-            )
-
-        rank_bytes = sum(op[5] for op in rank_ops)
-        logger.info(
-            "ModelExpress: rank %d: %d ops (%.2f GB) session=%s",
-            src_rank, len(rank_ops), rank_bytes / 1e9, session_id,
-        )
-
-        src_ptrs = [op[1] + op[2] for op in rank_ops]
-        dst_ptrs = [op[3] + op[4] for op in rank_ops]
-        lengths = [op[5] for op in rank_ops]
-        ret = transfer_engine.batch_transfer_sync_read(
-            session_id, dst_ptrs, src_ptrs, lengths,
-        )
-        if ret < 0:
-            raise RuntimeError(
-                f"ModelExpress: batch transfer from rank {src_rank} failed, error={ret}"
-            )
 
 
 class RemoteModelLoader(BaseModelLoader):
