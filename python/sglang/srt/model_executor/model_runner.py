@@ -688,7 +688,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return isinstance(module, RowParallelLinear)
 
     def _publish_model_express_metadata(self):
-        """Publish TransferEngine metadata to ModelExpress server (seed mode)."""
+        """Publish metadata to ModelExpress server (seed mode).
+
+        Supports two transports:
+        - "nixl": Uses NIXL/UCX (auto NVLink for intra-node). Default.
+        - "transfer_engine": Uses Mooncake TransferEngine.
+
+        Selected via --model-express-config '{"transport": "nixl"}'.
+        """
         from modelexpress.client import MxClient
         from modelexpress import p2p_pb2
 
@@ -697,6 +704,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             or self.server_args.model_path
         )
         mx_url = self.server_args.model_express_url
+
+        # Determine transport
+        transport = self.server_args._parsed_model_express_config.get("transport", "nixl")
+
+        if transport == "nixl":
+            self._publish_model_express_metadata_nixl(model_name, mx_url)
+            return
+
+        # TransferEngine path
         session_id = self.remote_instance_transfer_engine_session_id
         weight_info = self.remote_instance_transfer_engine_weight_info
 
@@ -821,6 +837,75 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
         finally:
             mx_client.close()
+
+    def _publish_model_express_metadata_nixl(self, model_name, mx_url):
+        """Publish NIXL metadata to ModelExpress server."""
+        import uuid
+        from modelexpress.client import MxClient
+        from modelexpress import p2p_pb2
+        from modelexpress.nixl_transfer import NixlTransferManager
+
+        agent_name = f"mx-seed-{self.tp_rank}-{uuid.uuid4().hex[:8]}"
+        nixl_mgr = NixlTransferManager(agent_name, self.gpu_id)
+        nixl_mgr.initialize()
+
+        # Register all model tensors with NIXL
+        tensors = {name: param for name, param in self.model.named_parameters()}
+        nixl_metadata = nixl_mgr.register_tensors(tensors)
+
+        # Build shard metadata using the SGLang adapter
+        from modelexpress.adapters.sglang import extract_target_params
+        param_infos = extract_target_params(self.model, self.tp_rank, self.tp_size)
+
+        tensor_descs = []
+        for pi in param_infos:
+            full_shape = list(pi.shape)
+            if pi.shard_dim >= 0 and pi.shard_dim < len(full_shape):
+                full_shape[pi.shard_dim] *= pi.effective_tp
+            # Handle non-contiguous tensors (FP8 .t())
+            if not pi.is_contiguous:
+                full_shape = full_shape[::-1]
+
+            tensor_descs.append(p2p_pb2.TensorDescriptor(
+                name=pi.name,
+                addr=pi.data_ptr,
+                size=pi.numel * pi.element_size,
+                device_id=self.gpu_id,
+                full_shape=full_shape,
+                shard_dim=pi.shard_dim,
+                effective_tp_size=pi.effective_tp,
+                shard_index=pi.shard_index,
+            ))
+
+        worker = p2p_pb2.WorkerMetadata(
+            worker_rank=self.tp_rank,
+            nixl_metadata=nixl_metadata,
+            tensors=tensor_descs,
+        )
+
+        mx_client = MxClient(server_url=mx_url)
+        try:
+            logger.info(
+                "ModelExpress source (NIXL): publishing metadata for model=%s, "
+                "tp_rank=%d, %d tensors",
+                model_name, self.tp_rank, len(tensor_descs),
+            )
+            mx_client.publish_metadata(model_name, [worker])
+            mx_client.publish_ready(
+                model_name,
+                worker_id=self.tp_rank,
+                session_id=mx_client.session_id,
+                metadata_hash="",
+            )
+            logger.info(
+                "ModelExpress source (NIXL): published ready for model=%s, tp_rank=%d",
+                model_name, self.tp_rank,
+            )
+        finally:
+            mx_client.close()
+
+        # Keep NIXL manager alive so the agent stays registered
+        self._mx_nixl_manager = nixl_mgr
 
     def model_specific_adjustment(self):
         server_args = self.server_args

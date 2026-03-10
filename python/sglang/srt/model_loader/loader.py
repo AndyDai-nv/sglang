@@ -2272,30 +2272,18 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         self, model, load_config: LoadConfig, device_config: DeviceConfig,
         model_config=None,
     ):
-        """Load weights via ModelExpress coordination + TransferEngine RDMA.
+        """Load weights via ModelExpress coordination + RDMA.
 
         Supports mixed tensor-parallelism: source TP != target TP.
-        Uses modelexpress.transfer_planner for plan computation and execution.
+        Auto-detects backend: NIXL (UCX, auto NVLink) or TransferEngine (Mooncake).
         """
         from modelexpress.adapters.sglang import extract_target_params
         from modelexpress.client import MxClient
         from modelexpress.transfer_planner import TransferPlanner, build_source_index
 
-        transfer_engine = load_config.remote_instance_weight_loader_transfer_engine
-        if transfer_engine is None:
-            raise RuntimeError(
-                "TransferEngine is not initialized for model_express backend."
-            )
         tp_rank = load_config.tp_rank
         tp_size = get_tensor_model_parallel_world_size()
         model_name = load_config.model_express_model_name
-
-        logger.info(
-            "ModelExpress: registering memory regions for tp_rank=%d...", tp_rank
-        )
-        self.remote_instance_transfer_engine_weight_info = register_memory_region(
-            model, transfer_engine
-        )
 
         # Wait for seed rank 0 to be ready, then fetch all workers
         mx_client = MxClient(server_url=load_config.model_express_url)
@@ -2321,15 +2309,41 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 "ModelExpress: got %d source workers", len(response.workers)
             )
 
-            source_index, rank_to_session = build_source_index(response.workers)
+            src_result = build_source_index(response.workers)
         finally:
             mx_client.close()
 
-        # Compute and execute transfer plan via modelexpress planner
+        logger.info("ModelExpress: detected backend=%s", src_result.backend)
+
+        # Register local memory based on backend
+        if src_result.backend == "nixl":
+            from modelexpress.nixl_transfer import NixlTransferManager
+            import uuid
+
+            agent_name = f"mx-target-{tp_rank}-{uuid.uuid4().hex[:8]}"
+            nixl_mgr = NixlTransferManager(agent_name, device_config.gpu_id)
+            nixl_mgr.initialize()
+
+            tensors = {name: param for name, param in model.named_parameters()}
+            nixl_mgr.register_tensors(tensors)
+        else:
+            transfer_engine = load_config.remote_instance_weight_loader_transfer_engine
+            if transfer_engine is None:
+                raise RuntimeError(
+                    "TransferEngine is not initialized for model_express backend."
+                )
+            logger.info(
+                "ModelExpress: registering memory regions for tp_rank=%d...", tp_rank
+            )
+            self.remote_instance_transfer_engine_weight_info = register_memory_region(
+                model, transfer_engine
+            )
+
+        # Compute transfer plan
         target_params = extract_target_params(model, tp_rank, tp_size)
         planner = TransferPlanner()
         ops, dim1_fixups = planner.compute_plan(
-            source_index, target_params, tp_rank, tp_size
+            src_result.source_index, target_params, tp_rank, tp_size
         )
 
         logger.info(
@@ -2337,7 +2351,15 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             len(ops), len(dim1_fixups),
         )
 
-        planner.execute(transfer_engine, ops, rank_to_session)
+        # Execute via detected backend
+        if src_result.backend == "nixl":
+            planner.execute_nixl(
+                nixl_mgr._agent, ops, src_result.rank_to_nixl_metadata,
+                device_config.gpu_id,
+            )
+        else:
+            planner.execute(transfer_engine, ops, src_result.rank_to_session)
+
         planner.apply_dim1_fixups(dim1_fixups)
 
         # Fix weight_scale: fill all elements with max(scale) so that
@@ -2356,6 +2378,9 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 quant_method.process_weights_after_loading(module)
         if hasattr(model, "post_load_weights"):
             model.post_load_weights()
+
+        if src_result.backend == "nixl":
+            nixl_mgr.shutdown()
 
         logger.info("ModelExpress: weight transfer complete for tp_rank=%d", tp_rank)
 

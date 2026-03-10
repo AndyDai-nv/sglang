@@ -2724,11 +2724,8 @@ class ServerArgs:
                         "Fallback load_format to 'auto' due to missing 'url' in --model-express-config."
                     )
                     self.load_format = "auto"
-                elif not self.validate_transfer_engine():
-                    logger.warning(
-                        "Fallback load_format to 'auto' due to 'transfer_engine' (required by model_express) not being supported."
-                    )
-                    self.load_format = "auto"
+                # TransferEngine validation only needed if not using NIXL.
+                # Target auto-detects backend from source metadata at runtime.
             elif (
                 self.remote_instance_weight_loader_seed_instance_ip is None
                 or self.remote_instance_weight_loader_seed_instance_service_port is None
@@ -5836,9 +5833,12 @@ class ServerArgs:
         # Use TransferEngine as seed backend.
         if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
             return True
-        # ModelExpress source mode also needs TransferEngine init.
+        # ModelExpress source mode needs TransferEngine unless using NIXL.
         if self.model_express_source:
-            return True
+            transport = self._parsed_model_express_config.get("transport", "nixl")
+            if transport != "nixl":
+                return True
+            return False
         # Use TransferEngine as client backend.
         elif (
             self.load_format == "remote_instance"
