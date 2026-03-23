@@ -79,9 +79,9 @@ class LoadConfig:
     modelexpress_url: Optional[str] = None
     modelexpress_model_name: Optional[str] = None
     # Fields for building SourceIdentity (needed by both seed and client)
-    modelexpress_tp_size: int = 1
-    modelexpress_pp_size: int = 1
-    modelexpress_ep_size: int = 1
+    modelexpress_tp_size: Optional[int] = None
+    modelexpress_pp_size: Optional[int] = None
+    modelexpress_ep_size: Optional[int] = None
     modelexpress_dtype: Optional[str] = None
     modelexpress_quantization: Optional[str] = None
 

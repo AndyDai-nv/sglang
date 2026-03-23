@@ -2292,6 +2292,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         try:
             import time
 
+            import grpc
             from modelexpress import p2p_pb2
             from modelexpress.client import MxClient
         except ImportError as exc:
@@ -2319,9 +2320,9 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         identity = p2p_pb2.SourceIdentity(
             model_name=model_name,
             backend_framework=p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
-            tensor_parallel_size=load_config.modelexpress_tp_size,
-            pipeline_parallel_size=load_config.modelexpress_pp_size,
-            expert_parallel_size=load_config.modelexpress_ep_size,
+            tensor_parallel_size=load_config.modelexpress_tp_size or 1,
+            pipeline_parallel_size=load_config.modelexpress_pp_size or 1,
+            expert_parallel_size=load_config.modelexpress_ep_size or 1,
             dtype=load_config.modelexpress_dtype or "",
             quantization=load_config.modelexpress_quantization or "",
         )
@@ -2329,6 +2330,15 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         # Poll list_sources until a READY worker with matching rank is found
         mx_client = MxClient(server_url=load_config.modelexpress_url)
         try:
+            # Verify MX server is reachable before entering the wait loop
+            try:
+                mx_client.list_sources()
+            except grpc.RpcError as e:
+                raise RuntimeError(
+                    f"ModelExpress: cannot reach server at "
+                    f"{load_config.modelexpress_url}: {e}"
+                ) from e
+
             logger.info(
                 "ModelExpress: waiting for seed ready (model=%s, rank=%d)...",
                 model_name,
