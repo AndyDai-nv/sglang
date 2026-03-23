@@ -2290,6 +2290,9 @@ class RemoteInstanceModelLoader(BaseModelLoader):
     ):
         """Load weights via ModelExpress coordination + TransferEngine RDMA."""
         try:
+            import time
+
+            from modelexpress import p2p_pb2
             from modelexpress.client import MxClient
         except ImportError as exc:
             raise ImportError(
@@ -2312,39 +2315,62 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             model, transfer_engine
         )
 
-        # Wait for seed to be ready via ModelExpress
+        # Build SourceIdentity matching the seed's identity
+        identity = p2p_pb2.SourceIdentity(
+            model_name=model_name,
+            backend_framework=p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
+            tensor_parallel_size=load_config.modelexpress_tp_size,
+            pipeline_parallel_size=load_config.modelexpress_pp_size,
+            expert_parallel_size=load_config.modelexpress_ep_size,
+            dtype=load_config.modelexpress_dtype or "",
+            quantization=load_config.modelexpress_quantization or "",
+        )
+
+        # Poll list_sources until a READY worker with matching rank is found
         mx_client = MxClient(server_url=load_config.modelexpress_url)
         try:
             logger.info(
-                "ModelExpress: waiting for seed ready (model=%s)...",
+                "ModelExpress: waiting for seed ready (model=%s, rank=%d)...",
                 model_name,
+                tp_rank,
             )
-            ready, session_id, metadata_hash = mx_client.wait_for_ready(
-                model_name,
-                worker_id=tp_rank,
-            )
-            if not ready:
+            max_wait_secs = 300
+            poll_interval = 2.0
+            elapsed = 0.0
+            source_ref = None
+            while elapsed < max_wait_secs:
+                resp = mx_client.list_sources(
+                    identity=identity,
+                    status_filter=p2p_pb2.SOURCE_STATUS_READY,
+                )
+                for inst in resp.instances:
+                    if inst.worker_rank == tp_rank:
+                        source_ref = inst
+                        break
+                if source_ref is not None:
+                    break
+                time.sleep(poll_interval)
+                elapsed += poll_interval
+
+            if source_ref is None:
                 raise RuntimeError(
-                    f"ModelExpress: timed out waiting for seed ready "
-                    f"(model={model_name}, worker={tp_rank})"
+                    f"ModelExpress: timed out ({max_wait_secs}s) waiting for "
+                    f"READY source (model={model_name}, rank={tp_rank})"
                 )
 
-            response = mx_client.get_metadata(model_name)
+            # Fetch full metadata for the discovered worker
+            response = mx_client.get_metadata(
+                mx_source_id=source_ref.mx_source_id,
+                worker_id=source_ref.worker_id,
+            )
             if not response.found:
                 raise RuntimeError(
-                    f"ModelExpress: no metadata found for model={model_name}"
+                    f"ModelExpress: no metadata found for "
+                    f"source_id={source_ref.mx_source_id}, "
+                    f"worker_id={source_ref.worker_id}"
                 )
 
-            # Find the worker matching our tp_rank
-            source_worker = None
-            for w in response.workers:
-                if w.worker_rank == tp_rank:
-                    source_worker = w
-                    break
-            if source_worker is None:
-                raise RuntimeError(
-                    f"ModelExpress: no worker metadata for rank={tp_rank}"
-                )
+            source_worker = response.worker
 
             # Extract session_id from oneof backend_metadata
             backend_field = source_worker.WhichOneof("backend_metadata")
