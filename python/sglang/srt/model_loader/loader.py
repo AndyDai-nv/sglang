@@ -2343,15 +2343,6 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         # Query MX server for a READY source matching our identity and rank
         mx_client = MxClient(server_url=load_config.modelexpress_url)
         try:
-            # Verify MX server is reachable before entering the wait loop
-            try:
-                mx_client.list_sources()
-            except grpc.RpcError as e:
-                raise RuntimeError(
-                    f"ModelExpress: cannot reach server at "
-                    f"{load_config.modelexpress_url}: {e}"
-                ) from e
-
             logger.info(
                 "ModelExpress: looking for seed (model=%s, rank=%d)...",
                 model_name,
@@ -2365,8 +2356,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             except grpc.RpcError as e:
                 raise RuntimeError(
                     f"ModelExpress: cannot reach server at "
-                    f"{load_config.modelexpress_url}: "
-                    f"{e.code()}: {e.details()}"
+                    f"{load_config.modelexpress_url}: {e}"
                 ) from e
 
             source_ref = None
