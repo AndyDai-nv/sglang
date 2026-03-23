@@ -2290,8 +2290,6 @@ class RemoteInstanceModelLoader(BaseModelLoader):
     ):
         """Load weights via ModelExpress coordination + TransferEngine RDMA."""
         try:
-            import time
-
             import grpc
             from modelexpress import p2p_pb2
             from modelexpress.client import MxClient
@@ -2327,45 +2325,36 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             quantization=load_config.modelexpress_quantization or "",
         )
 
-        # Poll list_sources until a READY worker with matching rank is found
+        # Query MX server for a READY source matching our identity and rank
         mx_client = MxClient(server_url=load_config.modelexpress_url)
         try:
-            # Verify MX server is reachable before entering the wait loop
+            logger.info(
+                "ModelExpress: looking for seed (model=%s, rank=%d)...",
+                model_name,
+                tp_rank,
+            )
             try:
-                mx_client.list_sources()
+                resp = mx_client.list_sources(
+                    identity=identity,
+                    status_filter=p2p_pb2.SOURCE_STATUS_READY,
+                )
             except grpc.RpcError as e:
                 raise RuntimeError(
                     f"ModelExpress: cannot reach server at "
                     f"{load_config.modelexpress_url}: {e}"
                 ) from e
 
-            logger.info(
-                "ModelExpress: waiting for seed ready (model=%s, rank=%d)...",
-                model_name,
-                tp_rank,
-            )
-            max_wait_secs = 300
-            poll_interval = 2.0
-            elapsed = 0.0
             source_ref = None
-            while elapsed < max_wait_secs:
-                resp = mx_client.list_sources(
-                    identity=identity,
-                    status_filter=p2p_pb2.SOURCE_STATUS_READY,
-                )
-                for inst in resp.instances:
-                    if inst.worker_rank == tp_rank:
-                        source_ref = inst
-                        break
-                if source_ref is not None:
+            for inst in resp.instances:
+                if inst.worker_rank == tp_rank:
+                    source_ref = inst
                     break
-                time.sleep(poll_interval)
-                elapsed += poll_interval
 
             if source_ref is None:
                 raise RuntimeError(
-                    f"ModelExpress: timed out ({max_wait_secs}s) waiting for "
-                    f"READY source (model={model_name}, rank={tp_rank})"
+                    f"ModelExpress: no READY source found for "
+                    f"model={model_name}, rank={tp_rank}. "
+                    f"Ensure the seed instance is running and has published metadata."
                 )
 
             # Fetch full metadata for the discovered worker
