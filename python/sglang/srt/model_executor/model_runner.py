@@ -24,6 +24,7 @@ import os
 import socket
 import threading
 import time
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
@@ -703,8 +704,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def _publish_modelexpress_metadata(self):
         """Publish TransferEngine metadata to ModelExpress server (seed mode)."""
         try:
-            import uuid
-
             from modelexpress import p2p_pb2
             from modelexpress.client import MxClient
         except ImportError as exc:
