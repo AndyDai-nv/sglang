@@ -2307,6 +2307,13 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         tp_rank = load_config.tp_rank
         model_name = load_config.modelexpress_model_name
 
+        target_device = torch.device(device_config.device)
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                with device_loading_context(module, target_device):
+                    quant_method.process_weights_after_loading(module)
+
         logger.info(
             "ModelExpress: registering memory regions for tp_rank=%d...", tp_rank
         )
