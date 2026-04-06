@@ -2348,7 +2348,8 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             except grpc.RpcError as e:
                 raise RuntimeError(
                     f"ModelExpress: cannot reach server at "
-                    f"{load_config.modelexpress_url}: {e}"
+                    f"{load_config.modelexpress_url}: "
+                    f"{e.code()}: {e.details()}"
                 ) from e
 
             source_ref = None
